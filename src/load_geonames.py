@@ -557,6 +557,14 @@ def create_indexes(engine: Engine) -> None:
         Index("geoname_longitude_idx",     t_geoname.c.longitude),
         Index("postalcodes_latitude_idx",  t_postalcodes.c.latitude),
         Index("postalcodes_longitude_idx", t_postalcodes.c.longitude),
+        # postalcodes — composite index for nearest-postal-code correlated subquery:
+        # equality on countrycode + range on latitude allows the DB to scan only
+        # postal codes in the right country within a lat/lon bounding box instead
+        # of performing a full country scan for every geoname result row.
+        Index("postalcodes_cc_lat_lon_idx",
+              t_postalcodes.c.countrycode,
+              t_postalcodes.c.latitude,
+              t_postalcodes.c.longitude),
     ]
     for idx in indexes:
         idx.create(engine)
@@ -596,6 +604,27 @@ def create_indexes(engine: Engine) -> None:
             "  [PostgreSQL: GIST geospatial indexes created"
             " via cube + earthdistance]"
         )
+
+        # --- PostGIS GIST indexes (optional — only if extension is installed) ---
+        # These coexist with the earthdistance indexes; the query planner picks
+        # the appropriate one depending on the functions used in each query.
+        with engine.connect() as conn:
+            postgis_count = conn.execute(text(
+                "SELECT count(*) FROM pg_extension WHERE extname = 'postgis'"
+            )).scalar()
+        if postgis_count:
+            pg_postgis = [
+                "CREATE INDEX IF NOT EXISTS geoname_postgis_idx ON geoname"
+                " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
+                "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
+                " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
+            ]
+            with engine.begin() as conn:
+                for stmt in pg_postgis:
+                    conn.execute(text(stmt))
+            print("  [PostgreSQL: PostGIS GIST indexes created]")
+        else:
+            print("  [PostGIS indexes skipped: extension not available]")
     else:
         print(
             "  [GIST geospatial indexes skipped:"

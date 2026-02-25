@@ -33,9 +33,13 @@
     The --url flag accepts any SQLAlchemy connection URL and overrides --config.
 
     Distance strategy (chosen automatically):
-    - PostgreSQL: uses the earthdistance extension (cube + ll_to_earth) with
-        a GIST index for fast KNN lookup (requires load_geonames.py to have
-        been run without --skip-indexes).
+    - PostgreSQL + PostGIS: uses ST_DWithin / ST_Distance with a GIST index
+        on ST_MakePoint(longitude, latitude)::geography (preferred when the
+        PostGIS extension is installed).
+    - PostgreSQL (no PostGIS): uses the earthdistance extension
+        (cube + ll_to_earth) with a GIST index for fast KNN lookup.
+    Both PostgreSQL strategies require load_geonames.py to have been run
+    without --skip-indexes.
     - Other dialects: Haversine formula executed server-side via SQL math
         functions (sin, cos, asin, sqrt). Available on MySQL/MariaDB and
         SQLite >= 3.35 (Python 3.8+). Falls back to a full table scan.
@@ -102,14 +106,22 @@ def load_config(path: str) -> dict:
 # -----------------------------------------------------------------------------
 
 
+def _normalize_url(url: str) -> str:
+    """Translate postgres:// → postgresql:// so SQLAlchemy can load the dialect."""
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+# _normalize_url
+
+
 def build_engine(args: argparse.Namespace) -> Engine:
     """Build a SQLAlchemy engine from --url or the config file."""
     if args.url:
-        return create_engine(args.url)
+        return create_engine(_normalize_url(args.url))
     cfg = load_config(args.config)
     db = cfg["database"]
     if "url" in db:
-        return create_engine(db["url"])
+        return create_engine(_normalize_url(db["url"]))
     return create_engine(
         f"postgresql+psycopg2://{db['user']}:{db['password']}"
         f"@{db['host']}:{db['port']}/{db['dbname']}"
@@ -123,6 +135,18 @@ def build_engine(args: argparse.Namespace) -> Engine:
 def is_postgresql(engine: Engine) -> bool:
     return engine.dialect.name == "postgresql"
 # is_postgresql
+
+
+# -----------------------------------------------------------------------------
+
+
+def _has_postgis(conn) -> bool:
+    """Return True if the PostGIS extension is installed in the current DB."""
+    count = conn.execute(text(
+        "SELECT count(*) FROM pg_extension WHERE extname = 'postgis'"
+    )).scalar()
+    return bool(count)
+# _has_postgis
 
 
 # ---------------------------------------------------------------------------
@@ -155,19 +179,135 @@ def _haversine_km(lat: float, lon: float, col_lat, col_lon):
 # _haversine_km
 
 
+def _haversine_col_km(lat1_col, lon1_col, lat2_col, lon2_col):
+    """
+    SQLAlchemy column expression for the Haversine distance (km) between
+    two column-referenced points (no fixed Python constants).
+    Used in correlated subqueries where both lat/lon are column expressions.
+    """
+    dlat = (lat2_col - lat1_col) * _RAD
+    dlon = (lon2_col - lon1_col) * _RAD
+    a = (
+        func.power(func.sin(dlat / 2), 2)
+        + func.cos(lat1_col * _RAD)
+        * func.cos(lat2_col * _RAD)
+        * func.power(func.sin(dlon / 2), 2)
+    )
+    return 2 * _EARTH_RADIUS_KM * func.asin(func.sqrt(a))
+# _haversine_col_km
+
+
 # ---------------------------------------------------------------------------
-# PostgreSQL earthdistance queries (use GIST index via earth_box pre-filter)
+# PostgreSQL queries
 # ---------------------------------------------------------------------------
 
-# Initial search radius for earth_box() pre-filter.
+# Initial search radius for pre-filtering (used by both strategies).
 # Increase if you expect the nearest result to be farther than this.
 _GEO_RADIUS_M = 500_000   # 500 km
 
+# Approximate degree equivalent of _GEO_RADIUS_M (1° ≈ 111 320 m at equator).
+# Used as a bounding-box pre-filter on lat/lon columns so the DB can use the
+# composite B-tree index (countrycode, latitude, longitude) instead of scanning
+# every postal code in the country to compute haversine ordering.
+_DEG_RADIUS = _GEO_RADIUS_M / 111_320.0  # ≈ 4.5°
+
+
+# ---------------------------------------------------------------------------
+# Strategy A: PostGIS (ST_DWithin / ST_Distance on geography type)
+# ---------------------------------------------------------------------------
+
+def _query_postal_postgis(conn, lat: float, lon: float, limit: int,
+                          country: str = None) -> list:
+    """
+    Postal-code query using PostGIS geography functions.
+    ST_DWithin() enables GIST index pre-filtering;
+    ST_Distance() provides accurate great-circle ordering (returns metres).
+    """
+    country_clause = "   AND countrycode = :country" if country else ""
+    stmt = text(
+        "SELECT countrycode, postalcode, placename,"
+        "       admin1name, admin2name, admin3name,"
+        "       latitude, longitude,"
+        "       ST_Distance("
+        "           ST_MakePoint(longitude, latitude)::geography,"
+        "           ST_MakePoint(:lon, :lat)::geography"
+        "       ) / 1000.0 AS distance_km"
+        " FROM postalcodes"
+        " WHERE latitude IS NOT NULL"
+        "   AND longitude IS NOT NULL"
+        "   AND ST_DWithin("
+        "           ST_MakePoint(longitude, latitude)::geography,"
+        "           ST_MakePoint(:lon, :lat)::geography,"
+        "           :radius"
+        "       )"
+        f" {country_clause}"
+        " ORDER BY distance_km"
+        " LIMIT :limit"
+    )
+    params = {"lat": lat, "lon": lon, "radius": _GEO_RADIUS_M, "limit": limit}
+    if country:
+        params["country"] = country
+    return conn.execute(stmt, params).fetchall()
+# _query_postal_postgis
+
+
+# -----------------------------------------------------------------------------
+
+
+def _query_geo_postgis(conn, lat: float, lon: float, limit: int,
+                       country: str = None) -> list:
+    """
+    Geoname query using PostGIS geography functions.
+    A LATERAL subquery finds the nearest postal code for each result row
+    using the GIST index via the <-> KNN operator.
+    """
+    country_clause = "   AND g.country = :country" if country else ""
+    stmt = text(
+        "SELECT g.geonameid, g.name, g.fclass, g.fcode, g.country,"
+        "       g.admin1, g.admin2, g.population, g.latitude, g.longitude,"
+        "       ST_Distance("
+        "           ST_MakePoint(g.longitude, g.latitude)::geography,"
+        "           ST_MakePoint(:lon, :lat)::geography"
+        "       ) / 1000.0 AS distance_km,"
+        "       pc.postalcode"
+        " FROM geoname g"
+        " LEFT JOIN LATERAL ("
+        "     SELECT postalcode FROM postalcodes"
+        "     WHERE countrycode = g.country"
+        "       AND latitude  IS NOT NULL AND longitude IS NOT NULL"
+        "       AND latitude  BETWEEN g.latitude  - :deg AND g.latitude  + :deg"
+        "       AND longitude BETWEEN g.longitude - :deg AND g.longitude + :deg"
+        "     ORDER BY ST_MakePoint(longitude, latitude)::geography"
+        "              <-> ST_MakePoint(g.longitude, g.latitude)::geography"
+        "     LIMIT 1"
+        " ) pc ON true"
+        " WHERE g.latitude IS NOT NULL"
+        "   AND g.longitude IS NOT NULL"
+        "   AND ST_DWithin("
+        "           ST_MakePoint(g.longitude, g.latitude)::geography,"
+        "           ST_MakePoint(:lon, :lat)::geography,"
+        "           :radius"
+        "       )"
+        f" {country_clause}"
+        " ORDER BY distance_km"
+        " LIMIT :limit"
+    )
+    params = {"lat": lat, "lon": lon, "radius": _GEO_RADIUS_M,
+              "limit": limit, "deg": _DEG_RADIUS}
+    if country:
+        params["country"] = country
+    return conn.execute(stmt, params).fetchall()
+# _query_geo_postgis
+
+
+# ---------------------------------------------------------------------------
+# Strategy B: earthdistance (earth_box / earth_distance)
+# ---------------------------------------------------------------------------
 
 def _query_postal_pg(conn, lat: float, lon: float, limit: int,
                      country: str = None) -> list:
     """
-    Postal-code query using PostgreSQL earthdistance extension.
+    Postal-code query using the PostgreSQL earthdistance extension.
     earth_box() enables GIST index pre-filtering;
     earth_distance() provides accurate ordering.
     """
@@ -202,26 +342,40 @@ def _query_postal_pg(conn, lat: float, lon: float, limit: int,
 def _query_geo_pg(conn, lat: float, lon: float, limit: int,
                   country: str = None) -> list:
     """
-    Geoname query using PostgreSQL earthdistance extension.
+    Geoname query using the PostgreSQL earthdistance extension.
+    A LATERAL subquery finds the nearest postal code for each result row
+    using the GIST index via the <-> KNN operator on the earth type.
     """
-    country_clause = "   AND country = :country" if country else ""
+    country_clause = "   AND g.country = :country" if country else ""
     stmt = text(
-        "SELECT geonameid, name, fclass, fcode, country,"
-        "       admin1, admin2, population, latitude, longitude,"
+        "SELECT g.geonameid, g.name, g.fclass, g.fcode, g.country,"
+        "       g.admin1, g.admin2, g.population, g.latitude, g.longitude,"
         "       earth_distance("
-        "           ll_to_earth(latitude, longitude),"
+        "           ll_to_earth(g.latitude, g.longitude),"
         "           ll_to_earth(:lat, :lon)"
-        "       ) / 1000.0 AS distance_km"
-        " FROM geoname"
-        " WHERE latitude IS NOT NULL"
-        "   AND longitude IS NOT NULL"
+        "       ) / 1000.0 AS distance_km,"
+        "       pc.postalcode"
+        " FROM geoname g"
+        " LEFT JOIN LATERAL ("
+        "     SELECT postalcode FROM postalcodes"
+        "     WHERE countrycode = g.country"
+        "       AND latitude  IS NOT NULL AND longitude IS NOT NULL"
+        "       AND latitude  BETWEEN g.latitude  - :deg AND g.latitude  + :deg"
+        "       AND longitude BETWEEN g.longitude - :deg AND g.longitude + :deg"
+        "     ORDER BY ll_to_earth(latitude, longitude)"
+        "              <-> ll_to_earth(g.latitude, g.longitude)"
+        "     LIMIT 1"
+        " ) pc ON true"
+        " WHERE g.latitude IS NOT NULL"
+        "   AND g.longitude IS NOT NULL"
         "   AND earth_box(ll_to_earth(:lat, :lon), :radius)"
-        "       @> ll_to_earth(latitude, longitude)"
+        "       @> ll_to_earth(g.latitude, g.longitude)"
         f" {country_clause}"
         " ORDER BY distance_km"
         " LIMIT :limit"
     )
-    params = {"lat": lat, "lon": lon, "radius": _GEO_RADIUS_M, "limit": limit}
+    params = {"lat": lat, "lon": lon, "radius": _GEO_RADIUS_M,
+              "limit": limit, "deg": _DEG_RADIUS}
     if country:
         params["country"] = country
     return conn.execute(stmt, params).fetchall()
@@ -238,6 +392,8 @@ def query_postalcodes(
 ):
     """Return the closest rows from postalcodes ordered by distance."""
     if is_postgresql(engine):
+        if _has_postgis(conn):
+            return _query_postal_postgis(conn, lat, lon, limit, country)
         return _query_postal_pg(conn, lat, lon, limit, country)
     pc = t_postalcodes.c
     dist = _haversine_km(lat, lon, pc.latitude, pc.longitude)
@@ -273,9 +429,26 @@ def query_geoname(
 ):
     """Return the closest rows from geoname ordered by distance."""
     if is_postgresql(engine):
+        if _has_postgis(conn):
+            return _query_geo_postgis(conn, lat, lon, limit, country)
         return _query_geo_pg(conn, lat, lon, limit, country)
     g = t_geoname.c
+    p = t_postalcodes.c
     dist = _haversine_km(lat, lon, g.latitude, g.longitude)
+    # Correlated subquery: nearest postal code to each geoname row.
+    postal_subq = (
+        select(p.postalcode)
+        .where(p.countrycode == g.country)
+        .where(p.latitude.is_not(None))
+        .where(p.longitude.is_not(None))
+        .where(p.latitude.between(g.latitude - _DEG_RADIUS, g.latitude + _DEG_RADIUS))
+        .where(p.longitude.between(g.longitude - _DEG_RADIUS, g.longitude + _DEG_RADIUS))
+        .order_by(_haversine_col_km(g.latitude, g.longitude, p.latitude, p.longitude))
+        .limit(1)
+        .correlate(t_geoname)
+        .scalar_subquery()
+        .label("postalcode")
+    )
     stmt = (
         select(
             g.geonameid,
@@ -289,6 +462,7 @@ def query_geoname(
             g.latitude,
             g.longitude,
             dist,
+            postal_subq,
         )
         .where(g.latitude.is_not(None))
         .where(g.longitude.is_not(None))
@@ -334,6 +508,8 @@ def _print_geoname(rows) -> None:
         print(f"  Country     : {r.country}")
         print(f"  Feature     : {r.fclass}/{r.fcode}")
         print(f"  Population  : {r.population or 0:,}")
+        if r.postalcode:
+            print(f"  Postal code : {r.postalcode}")
         print(f"  Coordinates : {r.latitude}, {r.longitude}")
         print(f"  Distance    : {r.distance_km:.3f} km")
         print()

@@ -167,13 +167,34 @@ python src/load_geonames.py --config /etc/geonames/config.yaml --overwrite --ski
 
 ## Distance strategy
 
-The strategy is chosen automatically based on the database dialect:
+The strategy is chosen automatically based on the database dialect and available extensions:
 
-| Dialect | Strategy | Notes |
-|---------|----------|-------|
-| PostgreSQL | `earthdistance` extension + GIST index (`earth_box`) | Fast KNN. Requires `load_geonames.py` to have been run **without** `--skip-indexes`. |
+| Dialect / Extensions | Strategy | Notes |
+|----------------------|----------|-------|
+| PostgreSQL + PostGIS | `ST_DWithin` / `ST_Distance` + GIST index | Preferred when the `postgis` extension is installed. |
+| PostgreSQL (no PostGIS) | `earthdistance` extension + GIST index (`earth_box`) | Used when PostGIS is not available. |
 | MySQL / MariaDB | Haversine formula in SQL | Full table scan (no spatial index equivalent). |
 | SQLite | Haversine formula in SQL | Requires SQLite ≥ 3.35 and CGO enabled (Go). |
+
+Both PostgreSQL strategies require `load_geonames.py` to have been run **without** `--skip-indexes`. The two GIST indexes coexist — the query planner selects the appropriate one based on the functions used.
+
+### PostgreSQL
+
+The recommended database is PostgreSQL. The loader automatically uses the [earthdistance](https://www.postgresql.org/docs/current/earthdistance.html) extension (built-in, available in most managed PostgreSQL services such as Aliyun RDS) for [great-circle distance](https://en.wikipedia.org/wiki/Great-circle_distance) calculations. If [PostGIS](https://postgis.net/) is installed, the loader additionally creates PostGIS GIST indexes and the example queries will prefer `ST_DWithin` / `ST_Distance` automatically.
+
+To check whether you have any of this extensions installed, use the \dx command in your `psql` client.
+
+```
+postgres=# \dx
+                                             Listado de extensiones instaladas
+    Nombre     | Versión | Versión por omisión |  Esquema   |                         Descripción
+---------------+---------+---------------------+------------+--------------------------------------------------------------
+ cube          | 1.5     | 1.5                 | public     | data type for multidimensional cubes
+ earthdistance | 1.2     | 1.2                 | public     | calculate great-circle distances on the surface of the Earth
+ plpgsql       | 1.0     | 1.0                 | pg_catalog | PL/pgSQL procedural language
+ postgis       | 3.6.2   | 3.6.2               | public     | PostGIS geometry and geography spatial types and functions
+(4 filas)
+```
 
 ---
 
@@ -299,7 +320,7 @@ go build -o reverse_geocode .
 
 ## Notes
 
-GeoNames data is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+* GeoNames data is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 ---
 

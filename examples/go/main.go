@@ -37,9 +37,13 @@ package main
 	Run "go mod tidy" once to resolve and download dependencies.
 
 	Distance strategy (chosen automatically by dialect):
-	  - PostgreSQL: uses earthdistance + GIST index (fast KNN via
-	    earth_box). Requires load_geonames.py to have been run without
-	    --skip-indexes.
+	  - PostgreSQL + PostGIS: uses ST_DWithin / ST_Distance with a GIST
+	    index on ST_MakePoint(longitude, latitude)::geography (preferred
+	    when the PostGIS extension is installed).
+	  - PostgreSQL (no PostGIS): uses earthdistance + GIST index (fast KNN
+	    via earth_box).
+	  Both PostgreSQL strategies require load_geonames.py to have been run
+	  without --skip-indexes.
 	  - MySQL/MariaDB, SQLite: Haversine formula executed entirely in SQL.
 	    Falls back to a full table scan (no GIST equivalent).
 	    SQLite requires CGO and math functions (SQLite >= 3.35).
@@ -75,9 +79,14 @@ import (
 
 const (
 	earthRadiusKm = 6371.0
-	// geoRadiusM is the earth_box() pre-filter radius (PostgreSQL only).
+	// geoRadiusM is the earth_box() / ST_DWithin() pre-filter radius.
 	// Increase if the nearest result could be farther than this distance.
 	geoRadiusM = 500_000 // 500 km
+	// degRadius is the approximate degree equivalent of geoRadiusM
+	// (1° ≈ 111 320 m at the equator). Used as a bounding-box pre-filter on
+	// lat/lon columns to let the DB use the composite B-tree index
+	// (countrycode, latitude, longitude) before computing haversine ordering.
+	degRadius = geoRadiusM / 111_320.0 // ≈ 4.5°
 )
 
 // ---------------------------------------------------------------------------
@@ -189,6 +198,12 @@ func isPostgres(db *gorm.DB) bool {
 	return db.Dialector.Name() == "postgres"
 }
 
+func hasPostGIS(db *gorm.DB) bool {
+	var count int64
+	db.Raw("SELECT count(*) FROM pg_extension WHERE extname = 'postgis'").Scan(&count)
+	return count > 0
+}
+
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
@@ -219,6 +234,87 @@ type GeonameResult struct {
 	Latitude   float64 `gorm:"column:latitude"`
 	Longitude  float64 `gorm:"column:longitude"`
 	DistanceKm float64 `gorm:"column:distance_km"`
+	Postalcode string  `gorm:"column:postalcode"`
+}
+
+// ---------------------------------------------------------------------------
+// PostgreSQL PostGIS queries (use GIST index via ST_DWithin)
+// ---------------------------------------------------------------------------
+
+func queryPostalPostGIS(
+	db *gorm.DB, lat, lon float64, limit int, country string,
+) ([]PostalResult, error) {
+	var rows []PostalResult
+	countryClause := ""
+	args := []interface{}{lon, lat, lon, lat, geoRadiusM, limit}
+	if country != "" {
+		countryClause = "  AND countrycode = ?"
+		args = []interface{}{lon, lat, lon, lat, geoRadiusM, country, limit}
+	}
+	rawSQL := fmt.Sprintf(`
+		SELECT countrycode, postalcode, placename,
+		       admin1name, admin2name, admin3name,
+		       latitude, longitude,
+		       ST_Distance(
+		           ST_MakePoint(longitude, latitude)::geography,
+		           ST_MakePoint(?, ?)::geography
+		       ) / 1000.0 AS distance_km
+		FROM postalcodes
+		WHERE latitude  IS NOT NULL
+		  AND longitude IS NOT NULL
+		  AND ST_DWithin(
+		          ST_MakePoint(longitude, latitude)::geography,
+		          ST_MakePoint(?, ?)::geography,
+		          ?
+		      )
+		%s
+		ORDER BY distance_km
+		LIMIT ?`, countryClause)
+	res := db.Raw(rawSQL, args...).Scan(&rows)
+	return rows, res.Error
+}
+
+func queryGeonamePostGIS(
+	db *gorm.DB, lat, lon float64, limit int, country string,
+) ([]GeonameResult, error) {
+	var rows []GeonameResult
+	countryClause := ""
+	args := []interface{}{lon, lat, lon, lat, geoRadiusM, limit}
+	if country != "" {
+		countryClause = "  AND g.country = ?"
+		args = []interface{}{lon, lat, lon, lat, geoRadiusM, country, limit}
+	}
+	rawSQL := fmt.Sprintf(`
+		SELECT g.geonameid, g.name, g.fclass, g.fcode, g.country,
+		       g.admin1, g.admin2, g.population, g.latitude, g.longitude,
+		       ST_Distance(
+		           ST_MakePoint(g.longitude, g.latitude)::geography,
+		           ST_MakePoint(?, ?)::geography
+		       ) / 1000.0 AS distance_km,
+		       pc.postalcode
+		FROM geoname g
+		LEFT JOIN LATERAL (
+		    SELECT postalcode FROM postalcodes
+		    WHERE countrycode = g.country
+		      AND latitude  IS NOT NULL AND longitude IS NOT NULL
+		      AND latitude  BETWEEN g.latitude  - %.4f AND g.latitude  + %.4f
+		      AND longitude BETWEEN g.longitude - %.4f AND g.longitude + %.4f
+		    ORDER BY ST_MakePoint(longitude, latitude)::geography
+		             <-> ST_MakePoint(g.longitude, g.latitude)::geography
+		    LIMIT 1
+		) pc ON true
+		WHERE g.latitude  IS NOT NULL
+		  AND g.longitude IS NOT NULL
+		  AND ST_DWithin(
+		          ST_MakePoint(g.longitude, g.latitude)::geography,
+		          ST_MakePoint(?, ?)::geography,
+		          ?
+		      )
+		%s
+		ORDER BY distance_km
+		LIMIT ?`, degRadius, degRadius, degRadius, degRadius, countryClause)
+	res := db.Raw(rawSQL, args...).Scan(&rows)
+	return rows, res.Error
 }
 
 // ---------------------------------------------------------------------------
@@ -262,24 +358,35 @@ func queryGeonamePostgres(
 	countryClause := ""
 	args := []interface{}{lat, lon, lat, lon, geoRadiusM, limit}
 	if country != "" {
-		countryClause = "  AND country = ?"
+		countryClause = "  AND g.country = ?"
 		args = []interface{}{lat, lon, lat, lon, geoRadiusM, country, limit}
 	}
 	rawSQL := fmt.Sprintf(`
-		SELECT geonameid, name, fclass, fcode, country,
-		       admin1, admin2, population, latitude, longitude,
+		SELECT g.geonameid, g.name, g.fclass, g.fcode, g.country,
+		       g.admin1, g.admin2, g.population, g.latitude, g.longitude,
 		       earth_distance(
-		           ll_to_earth(latitude, longitude),
+		           ll_to_earth(g.latitude, g.longitude),
 		           ll_to_earth(?, ?)
-		       ) / 1000.0 AS distance_km
-		FROM geoname
-		WHERE latitude  IS NOT NULL
-		  AND longitude IS NOT NULL
+		       ) / 1000.0 AS distance_km,
+		       pc.postalcode
+		FROM geoname g
+		LEFT JOIN LATERAL (
+		    SELECT postalcode FROM postalcodes
+		    WHERE countrycode = g.country
+		      AND latitude  IS NOT NULL AND longitude IS NOT NULL
+		      AND latitude  BETWEEN g.latitude  - %.4f AND g.latitude  + %.4f
+		      AND longitude BETWEEN g.longitude - %.4f AND g.longitude + %.4f
+		    ORDER BY ll_to_earth(latitude, longitude)
+		             <-> ll_to_earth(g.latitude, g.longitude)
+		    LIMIT 1
+		) pc ON true
+		WHERE g.latitude  IS NOT NULL
+		  AND g.longitude IS NOT NULL
 		  AND earth_box(ll_to_earth(?, ?), ?)
-		      @> ll_to_earth(latitude, longitude)
+		      @> ll_to_earth(g.latitude, g.longitude)
 		%s
 		ORDER BY distance_km
-		LIMIT ?`, countryClause)
+		LIMIT ?`, degRadius, degRadius, degRadius, degRadius, countryClause)
 	res := db.Raw(rawSQL, args...).Scan(&rows)
 	return rows, res.Error
 }
@@ -292,20 +399,51 @@ func queryGeonamePostgres(
 // point (lat, lon) vs. the columns named "latitude" and "longitude".
 // Uses repeated multiplication instead of POWER() for SQLite compatibility.
 func haversineExpr(lat, lon float64) string {
+	return haversineExprAlias(lat, lon, "")
+}
+
+// haversineExprAlias is like haversineExpr but prefixes column names with
+// the given table alias (e.g. "g" → "g.latitude"). Pass "" for no alias.
+func haversineExprAlias(lat, lon float64, alias string) string {
 	rad := math.Pi / 180.0
 	cosLat := math.Cos(lat * rad)
+	latCol, lonCol := "latitude", "longitude"
+	if alias != "" {
+		latCol = alias + ".latitude"
+		lonCol = alias + ".longitude"
+	}
 	return fmt.Sprintf(
 		`2.0 * %.10f * ASIN(SQRT(`+
-			`SIN((latitude  - %.10f) * %.10f / 2.0)`+
-			` * SIN((latitude  - %.10f) * %.10f / 2.0)`+
-			` + %.10f * COS(latitude * %.10f)`+
-			` * SIN((longitude - %.10f) * %.10f / 2.0)`+
-			` * SIN((longitude - %.10f) * %.10f / 2.0)`+
+			`SIN((%s - %.10f) * %.10f / 2.0)`+
+			` * SIN((%s - %.10f) * %.10f / 2.0)`+
+			` + %.10f * COS(%s * %.10f)`+
+			` * SIN((%s - %.10f) * %.10f / 2.0)`+
+			` * SIN((%s - %.10f) * %.10f / 2.0)`+
 			`))`,
 		earthRadiusKm,
-		lat, rad, lat, rad,
-		cosLat, rad,
-		lon, rad, lon, rad,
+		latCol, lat, rad, latCol, lat, rad,
+		cosLat, latCol, rad,
+		lonCol, lon, rad, lonCol, lon, rad,
+	)
+}
+
+// haversineColExpr returns a SQL expression for the Haversine distance (km)
+// between two column-referenced points using table aliases "g" (geoname) and
+// "p" (postalcodes). Used in correlated subqueries for nearest postal code.
+func haversineColExpr() string {
+	rad := math.Pi / 180.0
+	return fmt.Sprintf(
+		`2.0 * %.10f * ASIN(SQRT(`+
+			`SIN((p.latitude  - g.latitude)  * %.10f / 2.0)`+
+			` * SIN((p.latitude  - g.latitude)  * %.10f / 2.0)`+
+			` + COS(g.latitude * %.10f) * COS(p.latitude * %.10f)`+
+			` * SIN((p.longitude - g.longitude) * %.10f / 2.0)`+
+			` * SIN((p.longitude - g.longitude) * %.10f / 2.0)`+
+			`))`,
+		earthRadiusKm,
+		rad, rad,
+		rad, rad,
+		rad, rad,
 	)
 }
 
@@ -341,19 +479,30 @@ func queryGeonameHaversine(
 	countryClause := ""
 	args := []interface{}{limit}
 	if country != "" {
-		countryClause = "  AND country = ?"
+		countryClause = "  AND g.country = ?"
 		args = []interface{}{country, limit}
 	}
 	rawSQL := fmt.Sprintf(`
-		SELECT geonameid, name, fclass, fcode, country,
-		       admin1, admin2, population, latitude, longitude,
-		       %s AS distance_km
-		FROM geoname
-		WHERE latitude  IS NOT NULL
-		  AND longitude IS NOT NULL
+		SELECT g.geonameid, g.name, g.fclass, g.fcode, g.country,
+		       g.admin1, g.admin2, g.population, g.latitude, g.longitude,
+		       %s AS distance_km,
+		       (SELECT p.postalcode FROM postalcodes p
+		        WHERE p.countrycode = g.country
+		          AND p.latitude  IS NOT NULL AND p.longitude IS NOT NULL
+		          AND p.latitude  BETWEEN g.latitude  - %.4f AND g.latitude  + %.4f
+		          AND p.longitude BETWEEN g.longitude - %.4f AND g.longitude + %.4f
+		        ORDER BY %s
+		        LIMIT 1) AS postalcode
+		FROM geoname g
+		WHERE g.latitude  IS NOT NULL
+		  AND g.longitude IS NOT NULL
 		%s
 		ORDER BY distance_km
-		LIMIT ?`, haversineExpr(lat, lon), countryClause)
+		LIMIT ?`,
+		haversineExprAlias(lat, lon, "g"),
+		degRadius, degRadius, degRadius, degRadius,
+		haversineColExpr(),
+		countryClause)
 	res := db.Raw(rawSQL, args...).Scan(&rows)
 	return rows, res.Error
 }
@@ -366,6 +515,9 @@ func queryPostal(
 	db *gorm.DB, lat, lon float64, limit int, country string,
 ) ([]PostalResult, error) {
 	if isPostgres(db) {
+		if hasPostGIS(db) {
+			return queryPostalPostGIS(db, lat, lon, limit, country)
+		}
 		return queryPostalPostgres(db, lat, lon, limit, country)
 	}
 	return queryPostalHaversine(db, lat, lon, limit, country)
@@ -375,6 +527,9 @@ func queryGeoname(
 	db *gorm.DB, lat, lon float64, limit int, country string,
 ) ([]GeonameResult, error) {
 	if isPostgres(db) {
+		if hasPostGIS(db) {
+			return queryGeonamePostGIS(db, lat, lon, limit, country)
+		}
 		return queryGeonamePostgres(db, lat, lon, limit, country)
 	}
 	return queryGeonameHaversine(db, lat, lon, limit, country)
@@ -412,6 +567,9 @@ func printGeoname(rows []GeonameResult) {
 		fmt.Printf("  Country     : %s\n", r.Country)
 		fmt.Printf("  Feature     : %s/%s\n", r.Fclass, r.Fcode)
 		fmt.Printf("  Population  : %d\n", r.Population)
+		if r.Postalcode != "" {
+			fmt.Printf("  Postal code : %s\n", r.Postalcode)
+		}
 		fmt.Printf("  Coordinates : %g, %g\n", r.Latitude, r.Longitude)
 		fmt.Printf("  Distance    : %.3f km\n\n", r.DistanceKm)
 	}
@@ -483,7 +641,11 @@ func main() {
 
 	strategy := "Haversine (full scan)"
 	if isPostgres(db) {
-		strategy = "earthdistance (GIST index)"
+		if hasPostGIS(db) {
+			strategy = "PostGIS (GIST index)"
+		} else {
+			strategy = "earthdistance (GIST index)"
+		}
 	}
 
 	fmt.Println(strings.Repeat("=", 60))
