@@ -8,3 +8,6 @@ psycopg2-binary>=2.9   # PostgreSQL
 pymysql>=1.1           # MySQL / MariaDB
 # mysqlclient>=2.2     # MySQL / MariaDB (C-based alternative, faster)
 # SQLite uses Python's built-in sqlite3 — no extra driver needed
+
+# Development / testing
+pytest>=8.0
