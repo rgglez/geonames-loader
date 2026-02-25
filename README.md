@@ -99,7 +99,7 @@ already up to date (size check). ZIP archives are extracted automatically.
 Several files receive post-processing (header stripping, comment removal) to
 make them ready for bulk loading.
 
-```
+```bash
 src/download_geonames.py [--config CONFIG_FILE]
 ```
 
@@ -129,7 +129,7 @@ After loading, derived columns are populated (composite admin codes,
 ASCII-normalised name variants) and, unless `--skip-indexes` is passed, all
 indexes, primary keys, foreign keys, and geospatial GIST indexes are created.
 
-```
+```bash
 src/load_geonames.py [--config CONFIG_FILE] [--skip-indexes] [-o]
 ```
 
