@@ -1,5 +1,12 @@
 # geonames-loader
 
+[![License](https://img.shields.io/badge/GitHub-GPL--3.0-informational)](https://www.gnu.org/licenses/gpl-3.0.html)
+![GitHub all releases](https://img.shields.io/github/downloads/rgglez/geonames-loader/total)
+![GitHub issues](https://img.shields.io/github/issues/rgglez/geonames-loader)
+![GitHub commit activity](https://img.shields.io/github/commit-activity/y/rgglez/geonames-loader)
+![GitHub stars](https://img.shields.io/github/stars/rgglez/geonames-loader?style=social)
+![GitHub forks](https://img.shields.io/github/forks/rgglez/geonames-loader?style=social)
+
 Python scripts to download the [GeoNames](https://www.geonames.org/) data files and upload them into relational databases.
 
 > *The GeoNames geographical database covers all countries and contains over eleven million placenames that are available for download free of charge.*
