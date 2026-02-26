@@ -140,6 +140,19 @@ def is_postgresql(engine: Engine) -> bool:
 # -----------------------------------------------------------------------------
 
 
+def _detect_strategy(engine: Engine, conn) -> str:
+    """Return a human-readable name for the distance strategy in use."""
+    if is_postgresql(engine):
+        if _has_postgis(conn):
+            return "PostGIS (GIST index via ST_DWithin / ST_Distance)"
+        return "earthdistance (GIST index via earth_box / earth_distance)"
+    return "Haversine formula (full table scan)"
+# _detect_strategy
+
+
+# -----------------------------------------------------------------------------
+
+
 def _has_postgis(conn) -> bool:
     """Return True if the PostGIS extension is installed in the current DB."""
     count = conn.execute(text(
@@ -588,11 +601,13 @@ def main() -> None:
     print(f"  Results   : {args.results}")
     if args.country:
         print(f"  Country   : {args.country}")
-    print("=" * 60)
-    print()
 
     try:
         with engine.connect() as conn:
+            print(f"  Strategy  : {_detect_strategy(engine, conn)}")
+            print("=" * 60)
+            print()
+
             postal_rows = query_postalcodes(
                 engine, conn, args.lat, args.lon, args.results, args.country
             )
