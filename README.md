@@ -9,7 +9,7 @@
 
 Python scripts to download the [GeoNames](https://www.geonames.org/) data files and upload them into relational databases.
 
-> *The GeoNames geographical database covers all countries and contains over eleven million placenames that are available for download free of charge.*
+> *The GeoNames geographical database covers all countries and contains over eleven million placenames that are available for download free of charge. GeoNames data is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).*
 
 ---
 
@@ -315,12 +315,6 @@ go build -o reverse_geocode .
 ./reverse_geocode --lat 19.4326 --lon -99.1332
 ./reverse_geocode --lat 48.8566 --lon 2.3522 --country FR --results 5
 ```
-
----
-
-## Notes
-
-* GeoNames data is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 ---
 
