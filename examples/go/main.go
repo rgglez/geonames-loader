@@ -37,12 +37,15 @@ package main
 	Run "go mod tidy" once to resolve and download dependencies.
 
 	Distance strategy (chosen automatically by dialect):
+	  - PostgreSQL + Ganos (ganos_spatialref): uses ST_DWithin / ST_Distance
+	    with a GIST index on ST_MakePoint(longitude, latitude)::geography
+	    (preferred on Aliyun Apsara RDS for PostgreSQL).
 	  - PostgreSQL + PostGIS: uses ST_DWithin / ST_Distance with a GIST
 	    index on ST_MakePoint(longitude, latitude)::geography (preferred
 	    when the PostGIS extension is installed).
-	  - PostgreSQL (no PostGIS): uses earthdistance + GIST index (fast KNN
-	    via earth_box).
-	  Both PostgreSQL strategies require load_geonames.py to have been run
+	  - PostgreSQL (no Ganos/PostGIS): uses earthdistance + GIST index
+	    (fast KNN via earth_box).
+	  All PostgreSQL strategies require load_geonames.py to have been run
 	  without --skip-indexes.
 	  - MySQL/MariaDB, SQLite: Haversine formula executed entirely in SQL.
 	    Falls back to a full table scan (no GIST equivalent).
@@ -201,6 +204,17 @@ func isPostgres(db *gorm.DB) bool {
 func hasPostGIS(db *gorm.DB) bool {
 	var count int64
 	db.Raw("SELECT count(*) FROM pg_extension WHERE extname = 'postgis'").Scan(&count)
+	return count > 0
+}
+
+// hasGanos returns true if the Ganos (ganos_spatialref) extension is installed.
+// ganos_spatialref is installed as a dependency of ganos_geometry via
+// CREATE EXTENSION ganos_geometry CASCADE and serves as a reliable indicator
+// that the full Ganos spatial stack (including ST_Distance, ST_DWithin,
+// ST_MakePoint, and the ::geography type) is available on Aliyun Apsara RDS.
+func hasGanos(db *gorm.DB) bool {
+	var count int64
+	db.Raw("SELECT count(*) FROM pg_extension WHERE extname = 'ganos_spatialref'").Scan(&count)
 	return count > 0
 }
 
@@ -515,7 +529,7 @@ func queryPostal(
 	db *gorm.DB, lat, lon float64, limit int, country string,
 ) ([]PostalResult, error) {
 	if isPostgres(db) {
-		if hasPostGIS(db) {
+		if hasGanos(db) || hasPostGIS(db) {
 			return queryPostalPostGIS(db, lat, lon, limit, country)
 		}
 		return queryPostalPostgres(db, lat, lon, limit, country)
@@ -527,7 +541,7 @@ func queryGeoname(
 	db *gorm.DB, lat, lon float64, limit int, country string,
 ) ([]GeonameResult, error) {
 	if isPostgres(db) {
-		if hasPostGIS(db) {
+		if hasGanos(db) || hasPostGIS(db) {
 			return queryGeonamePostGIS(db, lat, lon, limit, country)
 		}
 		return queryGeonamePostgres(db, lat, lon, limit, country)
@@ -641,7 +655,9 @@ func main() {
 
 	strategy := "Haversine (full scan)"
 	if isPostgres(db) {
-		if hasPostGIS(db) {
+		if hasGanos(db) {
+			strategy = "Ganos/ganos_spatialref (GIST index)"
+		} else if hasPostGIS(db) {
 			strategy = "PostGIS (GIST index)"
 		} else {
 			strategy = "earthdistance (GIST index)"

@@ -33,12 +33,15 @@
     The --url flag accepts any SQLAlchemy connection URL and overrides --config.
 
     Distance strategy (chosen automatically):
+    - PostgreSQL + Ganos (ganos_spatialref): uses ST_DWithin / ST_Distance
+        with a GIST index on ST_MakePoint(longitude, latitude)::geography
+        (preferred on Aliyun Apsara RDS for PostgreSQL).
     - PostgreSQL + PostGIS: uses ST_DWithin / ST_Distance with a GIST index
         on ST_MakePoint(longitude, latitude)::geography (preferred when the
         PostGIS extension is installed).
-    - PostgreSQL (no PostGIS): uses the earthdistance extension
+    - PostgreSQL (no Ganos/PostGIS): uses the earthdistance extension
         (cube + ll_to_earth) with a GIST index for fast KNN lookup.
-    Both PostgreSQL strategies require load_geonames.py to have been run
+    All PostgreSQL strategies require load_geonames.py to have been run
     without --skip-indexes.
     - Other dialects: Haversine formula executed server-side via SQL math
         functions (sin, cos, asin, sqrt). Available on MySQL/MariaDB and
@@ -143,6 +146,8 @@ def is_postgresql(engine: Engine) -> bool:
 def _detect_strategy(engine: Engine, conn) -> str:
     """Return a human-readable name for the distance strategy in use."""
     if is_postgresql(engine):
+        if _has_ganos(conn):
+            return "Ganos/ganos_spatialref (GIST index via ST_DWithin / ST_Distance)"
         if _has_postgis(conn):
             return "PostGIS (GIST index via ST_DWithin / ST_Distance)"
         return "earthdistance (GIST index via earth_box / earth_distance)"
@@ -160,6 +165,21 @@ def _has_postgis(conn) -> bool:
     )).scalar()
     return bool(count)
 # _has_postgis
+
+
+def _has_ganos(conn) -> bool:
+    """Return True if the Ganos (ganos_spatialref) extension is installed.
+
+    ganos_spatialref is installed as a dependency of ganos_geometry via
+    CREATE EXTENSION ganos_geometry CASCADE and serves as a reliable indicator
+    that the full Ganos spatial stack (including ST_Distance, ST_DWithin,
+    ST_MakePoint, and the ::geography type) is available on Aliyun Apsara RDS.
+    """
+    count = conn.execute(text(
+        "SELECT count(*) FROM pg_extension WHERE extname = 'ganos_spatialref'"
+    )).scalar()
+    return bool(count)
+# _has_ganos
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +425,7 @@ def query_postalcodes(
 ):
     """Return the closest rows from postalcodes ordered by distance."""
     if is_postgresql(engine):
-        if _has_postgis(conn):
+        if _has_ganos(conn) or _has_postgis(conn):
             return _query_postal_postgis(conn, lat, lon, limit, country)
         return _query_postal_pg(conn, lat, lon, limit, country)
     pc = t_postalcodes.c
@@ -442,7 +462,7 @@ def query_geoname(
 ):
     """Return the closest rows from geoname ordered by distance."""
     if is_postgresql(engine):
-        if _has_postgis(conn):
+        if _has_ganos(conn) or _has_postgis(conn):
             return _query_geo_postgis(conn, lat, lon, limit, country)
         return _query_geo_pg(conn, lat, lon, limit, country)
     g = t_geoname.c

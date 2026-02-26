@@ -170,32 +170,58 @@ The strategy is chosen automatically based on the database dialect and available
 
 | Dialect / Extensions | Strategy | Notes |
 |----------------------|----------|-------|
+| PostgreSQL + Ganos (`ganos_spatialref`) | `ST_DWithin` / `ST_Distance` + GIST index | Preferred on Aliyun Apsara RDS for PostgreSQL. |
 | PostgreSQL + PostGIS | `ST_DWithin` / `ST_Distance` + GIST index | Preferred when the `postgis` extension is installed. |
-| PostgreSQL (no PostGIS) | `earthdistance` extension + GIST index (`earth_box`) | Used when PostGIS is not available. |
+| PostgreSQL (no Ganos/PostGIS) | `earthdistance` extension + GIST index (`earth_box`) | Used when neither Ganos nor PostGIS is available. |
 | MySQL / MariaDB | Haversine formula in SQL | Full table scan (no spatial index equivalent). |
 | SQLite | Haversine formula in SQL | Requires SQLite ≥ 3.35 and CGO enabled (Go). |
 
-Both PostgreSQL strategies require `load_geonames.py` to have been run **without** `--skip-indexes`. The two GIST indexes coexist — the query planner selects the appropriate one based on the functions used.
+All PostgreSQL strategies require `load_geonames.py` to have been run **without** `--skip-indexes`. The GIST indexes coexist — the query planner selects the appropriate one based on the functions used.
 
 ### PostgreSQL
 
-The recommended database is PostgreSQL. The loader automatically uses the [earthdistance](https://www.postgresql.org/docs/current/earthdistance.html) extension (built-in, available in most managed PostgreSQL services such as Aliyun RDS) for [great-circle distance](https://en.wikipedia.org/wiki/Great-circle_distance) calculations. If [PostGIS](https://postgis.net/) is installed, the loader additionally creates PostGIS GIST indexes and the example queries will prefer `ST_DWithin` / `ST_Distance` automatically.
+The recommended database is PostgreSQL. The loader automatically uses the [earthdistance](https://www.postgresql.org/docs/current/earthdistance.html) extension (built-in, available in most managed PostgreSQL services) for [great-circle distance](https://en.wikipedia.org/wiki/Great-circle_distance) calculations.
 
-To check whether you have any of this extensions installed, use the \dx command in your `psql` client.
+If [PostGIS](https://postgis.net/) is installed, the loader additionally creates PostGIS GIST indexes and the example queries will prefer `ST_DWithin` / `ST_Distance` automatically.
+
+On **Aliyun Apsara RDS for PostgreSQL**, [Ganos](https://www.alibabacloud.com/help/en/rds/apsaradb-rds-for-postgresql/introduction-to-ganos) is the native spatial extension. Install it with:
+
+```sql
+CREATE EXTENSION ganos_geometry WITH SCHEMA public CASCADE;
+```
+
+This installs `ganos_geometry` together with its dependency `ganos_spatialref` (among others). The examples detect the presence of `ganos_spatialref` in `pg_extension` and automatically use the Ganos-provided `ST_DWithin` / `ST_Distance` / `ST_MakePoint` functions, which are fully compatible with the PostGIS API. Do **not** mix Ganos and PostGIS extensions in the same schema.
+
+To check which extensions are installed, use the `\dx` command in `psql`.
+
+Standard PostgreSQL with PostGIS:
 
 ```
 postgres=# \dx
-                                             Listado de extensiones instaladas
-    Nombre     | Versión | Versión por omisión |  Esquema   |                         Descripción
----------------+---------+---------------------+------------+--------------------------------------------------------------
- cube          | 1.5     | 1.5                 | public     | data type for multidimensional cubes
- earthdistance | 1.2     | 1.2                 | public     | calculate great-circle distances on the surface of the Earth
- plpgsql       | 1.0     | 1.0                 | pg_catalog | PL/pgSQL procedural language
- postgis       | 3.6.2   | 3.6.2               | public     | PostGIS geometry and geography spatial types and functions
-(4 filas)
+                                             Installed extensions
+    Name       | Version |   Schema   |                         Description
+---------------+---------+------------+--------------------------------------------------------------
+ cube          | 1.5     | public     | data type for multidimensional cubes
+ earthdistance | 1.2     | public     | calculate great-circle distances on the surface of the Earth
+ plpgsql       | 1.0     | pg_catalog | PL/pgSQL procedural language
+ postgis       | 3.6.2   | public     | PostGIS geometry and geography spatial types and functions
+(4 rows)
 ```
 
-**Remember that the extensions will install in the current schema**
+Aliyun Apsara RDS with Ganos:
+
+```
+postgres=# \dx
+                                             Installed extensions
+       Name        | Version |   Schema   |                         Description
+-------------------+---------+------------+--------------------------------------------------------------
+ ganos_geometry    | 7.0     | public     | Ganos Geometry -- geometry types and spatial functions
+ ganos_spatialref  | 7.0     | public     | Ganos SpatialRef -- spatial reference system support
+ plpgsql           | 1.0     | pg_catalog | PL/pgSQL procedural language
+(3 rows)
+```
+
+**Remember that extensions are installed in the current schema.**
 
 ---
 
