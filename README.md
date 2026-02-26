@@ -84,8 +84,7 @@ mysql+pymysql://user:pass@host:3306/dbname
 sqlite:///path/to/file.db
 ```
 
-> The database must exist before running either script. Only tables and data
-> are created/populated — the database itself is never created automatically.
+**The database must exist before running either script. Only tables and data are created/populated — the database itself is never created automatically.**
 
 ---
 
@@ -195,6 +194,8 @@ postgres=# \dx
  postgis       | 3.6.2   | 3.6.2               | public     | PostGIS geometry and geography spatial types and functions
 (4 filas)
 ```
+
+**Remember that the extensions will install in the current schema**
 
 ---
 
