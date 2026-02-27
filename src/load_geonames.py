@@ -52,6 +52,7 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
+import tqdm
 import yaml
 from sqlalchemy import (
     BigInteger, Boolean, CHAR, Column, Date, DateTime, Float, Index,
@@ -322,8 +323,14 @@ def _copy_pg(engine: Engine, table: Table, columns: list[str],
     raw_conn = engine.raw_connection()
     try:
         with raw_conn.cursor() as cur, \
-             open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            cur.copy_expert(sql, f)
+             open(filepath, "r", encoding="utf-8", errors="replace") as f, \
+             tqdm.tqdm.wrapattr(
+                 f, "read",
+                 total=filepath.stat().st_size,
+                 desc=f"  {table.name}",
+                 unit="B", unit_scale=True, unit_divisor=1024,
+             ) as fwrapped:
+            cur.copy_expert(sql, fwrapped)
         raw_conn.commit()
     finally:
         raw_conn.close()
@@ -338,8 +345,13 @@ def _insert_chunks(engine: Engine, table: Table, columns: list[str],
     """Chunked INSERT bulk load for non-PostgreSQL engines (streams the file)."""
     count = 0
     chunk: list[dict] = []
-    with engine.begin() as conn:
-        for row in _iter_tsv_rows(filepath, columns):
+    with engine.begin() as conn, \
+         tqdm.tqdm(
+             _iter_tsv_rows(filepath, columns),
+             desc=f"  {table.name}",
+             unit=" rows", unit_scale=True, mininterval=0.5,
+         ) as pbar:
+        for row in pbar:
             chunk.append(row)
             if len(chunk) >= _CHUNK_SIZE:
                 conn.execute(table.insert(), chunk)
@@ -358,13 +370,10 @@ def _insert_chunks(engine: Engine, table: Table, columns: list[str],
 def load_file(engine: Engine, table: Table, columns: list[str],
               filepath: Path) -> None:
     """Load a TSV data file into a table using the best method for the dialect."""
-    print(f"  Loading {table.name} from {filepath.name} ...", end=" ", flush=True)
     if is_postgresql(engine):
         _copy_pg(engine, table, columns, filepath)
-        print("done")
     else:
-        count = _insert_chunks(engine, table, columns, filepath)
-        print(f"done ({count:,} rows)")
+        _insert_chunks(engine, table, columns, filepath)
 # load_file
 
 
@@ -409,7 +418,7 @@ def _enrich_nameascii_python(engine: Engine) -> None:
         if not names:
             continue
         with engine.begin() as conn:
-            for name in names:
+            for name in tqdm.tqdm(names, desc=f"  {src_col.key}", unit=" names"):
                 conn.execute(
                     update(t_postalcodes)
                     .where(src_col == name)
@@ -423,7 +432,7 @@ def _enrich_nameascii_python(engine: Engine) -> None:
 
 def enrich_admin_codes(engine: Engine) -> None:
     """Populate all derived columns after the initial bulk load."""
-    print("  Enriching admin-codes tables ...", end=" ", flush=True)
+    print("  Enriching admin-codes tables ...")
 
     with engine.begin() as conn:
         # Fix nulls: admin1codesascii.name ← nameascii where name is NULL
@@ -491,7 +500,6 @@ def enrich_admin_codes(engine: Engine) -> None:
     else:
         _enrich_nameascii_python(engine)
 
-    print("done")
 # enrich_admin_codes
 
 
@@ -585,8 +593,10 @@ def create_indexes(engine: Engine) -> None:
               t_postalcodes.c.latitude,
               t_postalcodes.c.longitude),
     ]
-    for idx in indexes:
-        idx.create(engine)
+    with tqdm.tqdm(indexes, desc="  indexes", unit=" idx") as pbar:
+        for idx in pbar:
+            pbar.set_postfix_str(idx.name)
+            idx.create(engine)
 
     # --- Foreign keys (PostgreSQL and MySQL/MariaDB) ---
     if dialect in ("postgresql", "mysql", "mariadb"):
@@ -642,12 +652,22 @@ def create_indexes(engine: Engine) -> None:
 
         if has_ganos or has_postgis:
             label = "Ganos/ganos_spatialref" if has_ganos else "PostGIS"
-            geo_stmts = [
-                "CREATE INDEX IF NOT EXISTS geoname_postgis_idx ON geoname"
-                " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
-                "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
-                " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
-            ]
+            # Ganos (Aliyun) uses geometry; the ::geography cast is not available.
+            # PostGIS supports both, but geography gives better distance accuracy.
+            if has_ganos:
+                geo_stmts = [
+                    "CREATE INDEX IF NOT EXISTS geoname_postgis_idx ON geoname"
+                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
+                    "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
+                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
+                ]
+            else:
+                geo_stmts = [
+                    "CREATE INDEX IF NOT EXISTS geoname_postgis_idx ON geoname"
+                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
+                    "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
+                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
+                ]
             try:
                 with engine.begin() as conn:
                     for stmt in geo_stmts:
