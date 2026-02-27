@@ -33,9 +33,10 @@
     The --url flag accepts any SQLAlchemy connection URL and overrides --config.
 
     Distance strategy (chosen automatically):
-    - PostgreSQL + Ganos (ganos_spatialref): uses ST_DWithin / ST_Distance
-        with a GIST index on ST_MakePoint(longitude, latitude)::geography
-        (preferred on Aliyun Apsara RDS for PostgreSQL).
+    - PostgreSQL + Ganos (ganos_spatialref): uses ST_DWithin / ST_DistanceSphere
+        with a GIST index on ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)
+        (geometry SRID 4326; Aliyun Apsara RDS registers the geography type but
+        does not support the geometry::geography cast).
     - PostgreSQL + PostGIS: uses ST_DWithin / ST_Distance with a GIST index
         on ST_MakePoint(longitude, latitude)::geography (preferred when the
         PostGIS extension is installed).
@@ -146,9 +147,9 @@ def is_postgresql(engine: Engine) -> bool:
 def _detect_strategy(engine: Engine, conn) -> str:
     """Return a human-readable name for the distance strategy in use."""
     if is_postgresql(engine):
+        if _has_ganos(conn):
+            return "Ganos/ganos_spatialref (GIST index via ST_DWithin / ST_DistanceSphere)"
         if _has_geography_type(conn):
-            if _has_ganos(conn):
-                return "Ganos/ganos_spatialref (GIST index via ST_DWithin / ST_Distance)"
             return "PostGIS (GIST index via ST_DWithin / ST_Distance)"
         return "earthdistance (GIST index via earth_box / earth_distance)"
     return "Haversine formula (full table scan)"
@@ -337,7 +338,93 @@ def _query_geo_postgis(conn, lat: float, lon: float, limit: int,
 
 
 # ---------------------------------------------------------------------------
-# Strategy B: earthdistance (earth_box / earth_distance)
+# Strategy B: Ganos (ST_DWithin / ST_DistanceSphere on geometry SRID 4326)
+# ---------------------------------------------------------------------------
+# Aliyun Apsara RDS with ganos_spatialref registers the geography type in
+# pg_type but does not support the geometry::geography cast.  The GIST index
+# on these databases is created with ST_SetSRID(ST_MakePoint(...), 4326)
+# (plain geometry), so queries must also use geometry expressions to hit it.
+# ST_DistanceSphere(geom_a, geom_b) returns metres on SRID 4326 geometry;
+# ST_DWithin on geometry SRID 4326 expects the radius in degrees.
+
+def _query_postal_ganos(conn, lat: float, lon: float, limit: int,
+                        country: str = None) -> list:
+    """Postal-code query for Ganos: geometry GIST + ST_DistanceSphere."""
+    country_clause = "   AND countrycode = :country" if country else ""
+    stmt = text(
+        "SELECT countrycode, postalcode, placename,"
+        "       admin1name, admin2name, admin3name,"
+        "       latitude, longitude,"
+        "       ST_DistanceSphere("
+        "           ST_MakePoint(longitude, latitude),"
+        "           ST_MakePoint(:lon, :lat)"
+        "       ) / 1000.0 AS distance_km"
+        " FROM postalcodes"
+        " WHERE latitude IS NOT NULL"
+        "   AND longitude IS NOT NULL"
+        "   AND ST_DWithin("
+        "           ST_SetSRID(ST_MakePoint(longitude, latitude), 4326),"
+        "           ST_SetSRID(ST_MakePoint(:lon, :lat), 4326),"
+        "           :radius_deg"
+        "       )"
+        f" {country_clause}"
+        " ORDER BY distance_km"
+        " LIMIT :limit"
+    )
+    params = {"lat": lat, "lon": lon, "radius_deg": _DEG_RADIUS, "limit": limit}
+    if country:
+        params["country"] = country
+    return conn.execute(stmt, params).fetchall()
+# _query_postal_ganos
+
+
+# -----------------------------------------------------------------------------
+
+
+def _query_geo_ganos(conn, lat: float, lon: float, limit: int,
+                     country: str = None) -> list:
+    """Geoname query for Ganos: geometry GIST + ST_DistanceSphere."""
+    country_clause = "   AND g.country = :country" if country else ""
+    stmt = text(
+        "SELECT g.geonameid, g.name, g.fclass, g.fcode, g.country,"
+        "       g.admin1, g.admin2, g.population, g.latitude, g.longitude,"
+        "       ST_DistanceSphere("
+        "           ST_MakePoint(g.longitude, g.latitude),"
+        "           ST_MakePoint(:lon, :lat)"
+        "       ) / 1000.0 AS distance_km,"
+        "       pc.postalcode"
+        " FROM geoname g"
+        " LEFT JOIN LATERAL ("
+        "     SELECT postalcode FROM postalcodes"
+        "     WHERE countrycode = g.country"
+        "       AND latitude  IS NOT NULL AND longitude IS NOT NULL"
+        "       AND latitude  BETWEEN g.latitude  - :deg AND g.latitude  + :deg"
+        "       AND longitude BETWEEN g.longitude - :deg AND g.longitude + :deg"
+        "     ORDER BY ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)"
+        "              <-> ST_SetSRID(ST_MakePoint(g.longitude, g.latitude), 4326)"
+        "     LIMIT 1"
+        " ) pc ON true"
+        " WHERE g.latitude IS NOT NULL"
+        "   AND g.longitude IS NOT NULL"
+        "   AND ST_DWithin("
+        "           ST_SetSRID(ST_MakePoint(g.longitude, g.latitude), 4326),"
+        "           ST_SetSRID(ST_MakePoint(:lon, :lat), 4326),"
+        "           :radius_deg"
+        "       )"
+        f" {country_clause}"
+        " ORDER BY distance_km"
+        " LIMIT :limit"
+    )
+    params = {"lat": lat, "lon": lon, "radius_deg": _DEG_RADIUS,
+              "limit": limit, "deg": _DEG_RADIUS}
+    if country:
+        params["country"] = country
+    return conn.execute(stmt, params).fetchall()
+# _query_geo_ganos
+
+
+# ---------------------------------------------------------------------------
+# Strategy C: earthdistance (earth_box / earth_distance)
 # ---------------------------------------------------------------------------
 
 def _query_postal_pg(conn, lat: float, lon: float, limit: int,
@@ -428,6 +515,8 @@ def query_postalcodes(
 ):
     """Return the closest rows from postalcodes ordered by distance."""
     if is_postgresql(engine):
+        if _has_ganos(conn):
+            return _query_postal_ganos(conn, lat, lon, limit, country)
         if _has_geography_type(conn):
             return _query_postal_postgis(conn, lat, lon, limit, country)
         return _query_postal_pg(conn, lat, lon, limit, country)
@@ -465,6 +554,8 @@ def query_geoname(
 ):
     """Return the closest rows from geoname ordered by distance."""
     if is_postgresql(engine):
+        if _has_ganos(conn):
+            return _query_geo_ganos(conn, lat, lon, limit, country)
         if _has_geography_type(conn):
             return _query_geo_postgis(conn, lat, lon, limit, country)
         return _query_geo_pg(conn, lat, lon, limit, country)
