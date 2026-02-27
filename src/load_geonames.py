@@ -637,7 +637,7 @@ def create_indexes(engine: Engine) -> None:
         # These coexist with the earthdistance indexes when both are present;
         # the query planner picks the appropriate one for each query.
         with engine.connect() as conn:
-            has_ganos   = _has_extension(conn, "ganos_spatialref")
+            has_ganos = _has_extension(conn, "ganos_spatialref")
             has_postgis = _has_extension(conn, "postgis")
 
         if has_ganos or has_postgis:
@@ -648,10 +648,16 @@ def create_indexes(engine: Engine) -> None:
                 "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
                 " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
             ]
-            with engine.begin() as conn:
-                for stmt in geo_stmts:
-                    conn.execute(text(stmt))
-            print(f"  [PostgreSQL: {label} GIST indexes created]")
+            try:
+                with engine.begin() as conn:
+                    for stmt in geo_stmts:
+                        conn.execute(text(stmt))
+                print(f"  [PostgreSQL: {label} GIST indexes created]")
+            except Exception as exc:
+                # geography type may be absent even when ganos_spatialref /
+                # postgis is installed (e.g. ganos_geometry not loaded via
+                # CASCADE).  Fall back to earthdistance indexes already created.
+                print(f"  [{label} GIST indexes skipped: {exc}]")
         else:
             print("  [Ganos/PostGIS indexes skipped: neither extension is available]")
     else:

@@ -146,9 +146,9 @@ def is_postgresql(engine: Engine) -> bool:
 def _detect_strategy(engine: Engine, conn) -> str:
     """Return a human-readable name for the distance strategy in use."""
     if is_postgresql(engine):
-        if _has_ganos(conn):
-            return "Ganos/ganos_spatialref (GIST index via ST_DWithin / ST_Distance)"
-        if _has_postgis(conn):
+        if _has_geography_type(conn):
+            if _has_ganos(conn):
+                return "Ganos/ganos_spatialref (GIST index via ST_DWithin / ST_Distance)"
             return "PostGIS (GIST index via ST_DWithin / ST_Distance)"
         return "earthdistance (GIST index via earth_box / earth_distance)"
     return "Haversine formula (full table scan)"
@@ -168,18 +168,30 @@ def _has_postgis(conn) -> bool:
 
 
 def _has_ganos(conn) -> bool:
-    """Return True if the Ganos (ganos_spatialref) extension is installed.
-
-    ganos_spatialref is installed as a dependency of ganos_geometry via
-    CREATE EXTENSION ganos_geometry CASCADE and serves as a reliable indicator
-    that the full Ganos spatial stack (including ST_Distance, ST_DWithin,
-    ST_MakePoint, and the ::geography type) is available on Aliyun Apsara RDS.
-    """
+    """Return True if the ganos_spatialref extension is installed."""
     count = conn.execute(text(
         "SELECT count(*) FROM pg_extension WHERE extname = 'ganos_spatialref'"
     )).scalar()
     return bool(count)
 # _has_ganos
+
+
+def _has_geography_type(conn) -> bool:
+    """Return True if the 'geography' PostgreSQL type is actually available.
+
+    Checking for the extension alone (ganos_spatialref or postgis) is not
+    sufficient: on some Aliyun Apsara RDS configurations ganos_spatialref is
+    present but the geography type is not registered because ganos_geometry
+    was not installed with CASCADE.  The ::geography cast — used in all
+    ST_DWithin / ST_Distance queries and indexes — will raise a SyntaxError
+    if the type is absent.  This function is the real gate for the
+    geography-based strategy.
+    """
+    count = conn.execute(text(
+        "SELECT count(*) FROM pg_type WHERE typname = 'geography'"
+    )).scalar()
+    return bool(count)
+# _has_geography_type
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +437,7 @@ def query_postalcodes(
 ):
     """Return the closest rows from postalcodes ordered by distance."""
     if is_postgresql(engine):
-        if _has_ganos(conn) or _has_postgis(conn):
+        if _has_geography_type(conn):
             return _query_postal_postgis(conn, lat, lon, limit, country)
         return _query_postal_pg(conn, lat, lon, limit, country)
     pc = t_postalcodes.c
@@ -462,7 +474,7 @@ def query_geoname(
 ):
     """Return the closest rows from geoname ordered by distance."""
     if is_postgresql(engine):
-        if _has_ganos(conn) or _has_postgis(conn):
+        if _has_geography_type(conn):
             return _query_geo_postgis(conn, lat, lon, limit, country)
         return _query_geo_pg(conn, lat, lon, limit, country)
     g = t_geoname.c
