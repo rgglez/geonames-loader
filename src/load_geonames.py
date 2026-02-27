@@ -652,26 +652,22 @@ def create_indexes(engine: Engine) -> None:
 
         if has_ganos or has_postgis:
             label = "Ganos/ganos_spatialref" if has_ganos else "PostGIS"
-            # Use ::geography when the type is registered; fall back to geometry
-            # SRID 4326 on Aliyun Ganos configurations where ganos_geometry was
-            # not loaded with CASCADE and the geography type is absent.
-            with engine.connect() as conn:
-                has_geography = bool(conn.execute(text(
-                    "SELECT count(*) FROM pg_type WHERE typname = 'geography'"
-                )).scalar())
-            if has_geography:
+            # Ganos registers the geography type in pg_type but does not support
+            # the geometry::geography cast used in the GIST expression.
+            # Use plain geometry SRID 4326 for Ganos; PostGIS supports ::geography.
+            if has_ganos:
                 geo_stmts = [
                     "CREATE INDEX IF NOT EXISTS geoname_postgis_idx ON geoname"
-                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
+                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
                     "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
-                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
+                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
                 ]
             else:
                 geo_stmts = [
                     "CREATE INDEX IF NOT EXISTS geoname_postgis_idx ON geoname"
-                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
+                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
                     "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
-                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
+                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
                 ]
             try:
                 with engine.begin() as conn:
