@@ -249,6 +249,16 @@ def is_postgresql(engine: Engine) -> bool:
 # is_postgresql
 
 
+def _has_extension(conn, name: str) -> bool:
+    """Return True if the named PostgreSQL extension is installed."""
+    count = conn.execute(
+        text("SELECT count(*) FROM pg_extension WHERE extname = :n"),
+        {"n": name},
+    ).scalar()
+    return bool(count)
+# _has_extension
+
+
 # ---------------------------------------------------------------------------
 # Table management
 # ---------------------------------------------------------------------------
@@ -260,8 +270,12 @@ def drop_and_create_tables(engine: Engine) -> None:
             # CASCADE handles FK-dependent tables automatically
             for tbl in _DROP_ORDER:
                 conn.execute(text(f"DROP TABLE IF EXISTS {tbl.name} CASCADE"))
-            # unaccent extension is required for the enrichment step
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS unaccent"))
+            # unaccent is used for accent-stripped name variants; not available
+            # on all managed PostgreSQL services — fall back gracefully.
+            try:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS unaccent"))
+            except Exception:
+                pass  # enrich_admin_codes() will fall back to Python stripping
         else:
             for tbl in _DROP_ORDER:
                 conn.execute(text(f"DROP TABLE IF EXISTS {tbl.name}"))
@@ -462,13 +476,18 @@ def enrich_admin_codes(engine: Engine) -> None:
 
     # Accent-stripped name variants
     if is_postgresql(engine):
-        with engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE postalcodes SET"
-                " admin1nameascii = unaccent(admin1name),"
-                " admin2nameascii = unaccent(admin2name),"
-                " admin3nameascii = unaccent(admin3name)"
-            ))
+        with engine.connect() as conn:
+            use_unaccent = _has_extension(conn, "unaccent")
+        if use_unaccent:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE postalcodes SET"
+                    " admin1nameascii = unaccent(admin1name),"
+                    " admin2nameascii = unaccent(admin2name),"
+                    " admin3nameascii = unaccent(admin3name)"
+                ))
+        else:
+            _enrich_nameascii_python(engine)
     else:
         _enrich_nameascii_python(engine)
 
@@ -586,45 +605,55 @@ def create_indexes(engine: Engine) -> None:
     else:
         print("  [Foreign key constraints skipped: not supported by this dialect]")
 
-    # --- Geospatial GIST indexes (PostgreSQL + cube + earthdistance) ---
+    # --- Geospatial GIST indexes (PostgreSQL only) ---
     # On other dialects the B-tree indexes above are the best available.
     if dialect == "postgresql":
-        pg_geo = [
-            "CREATE EXTENSION IF NOT EXISTS cube",
-            "CREATE EXTENSION IF NOT EXISTS earthdistance",
-            "CREATE INDEX geoname_geo_idx ON geoname"
-            " USING GIST (ll_to_earth(latitude, longitude))",
-            "CREATE INDEX postalcodes_geo_idx ON postalcodes"
-            " USING GIST (ll_to_earth(latitude, longitude))",
-        ]
-        with engine.begin() as conn:
-            for stmt in pg_geo:
-                conn.execute(text(stmt))
-        print(
-            "  [PostgreSQL: GIST geospatial indexes created"
-            " via cube + earthdistance]"
-        )
+        # earthdistance GIST indexes — fallback strategy when neither Ganos
+        # nor PostGIS is installed.  Wrapped in try/except because cube and
+        # earthdistance are not available on all managed PostgreSQL services
+        # (e.g. Aliyun Apsara RDS when the Ganos suite is used instead).
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS cube"))
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS earthdistance"))
+                conn.execute(text(
+                    "CREATE INDEX geoname_geo_idx ON geoname"
+                    " USING GIST (ll_to_earth(latitude, longitude))"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX postalcodes_geo_idx ON postalcodes"
+                    " USING GIST (ll_to_earth(latitude, longitude))"
+                ))
+            print(
+                "  [PostgreSQL: GIST geospatial indexes created"
+                " via cube + earthdistance]"
+            )
+        except Exception as exc:
+            print(f"  [earthdistance GIST indexes skipped: {exc}]")
 
-        # --- PostGIS GIST indexes (optional — only if extension is installed) ---
-        # These coexist with the earthdistance indexes; the query planner picks
-        # the appropriate one depending on the functions used in each query.
+        # --- ST_MakePoint geography GIST indexes (Ganos or PostGIS) ---
+        # Required by the ST_DWithin / ST_Distance query path used when
+        # ganos_spatialref (Aliyun Apsara RDS) or postgis is installed.
+        # These coexist with the earthdistance indexes when both are present;
+        # the query planner picks the appropriate one for each query.
         with engine.connect() as conn:
-            postgis_count = conn.execute(text(
-                "SELECT count(*) FROM pg_extension WHERE extname = 'postgis'"
-            )).scalar()
-        if postgis_count:
-            pg_postgis = [
+            has_ganos   = _has_extension(conn, "ganos_spatialref")
+            has_postgis = _has_extension(conn, "postgis")
+
+        if has_ganos or has_postgis:
+            label = "Ganos/ganos_spatialref" if has_ganos else "PostGIS"
+            geo_stmts = [
                 "CREATE INDEX IF NOT EXISTS geoname_postgis_idx ON geoname"
                 " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
                 "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
                 " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
             ]
             with engine.begin() as conn:
-                for stmt in pg_postgis:
+                for stmt in geo_stmts:
                     conn.execute(text(stmt))
-            print("  [PostgreSQL: PostGIS GIST indexes created]")
+            print(f"  [PostgreSQL: {label} GIST indexes created]")
         else:
-            print("  [PostGIS indexes skipped: extension not available]")
+            print("  [Ganos/PostGIS indexes skipped: neither extension is available]")
     else:
         print(
             "  [GIST geospatial indexes skipped:"
@@ -709,9 +738,12 @@ def main() -> None:
             print("\nCreating tables (if not exist) ...")
             if is_postgresql(engine):
                 with engine.begin() as conn:
-                    conn.execute(
-                        text("CREATE EXTENSION IF NOT EXISTS unaccent")
-                    )
+                    try:
+                        conn.execute(
+                            text("CREATE EXTENSION IF NOT EXISTS unaccent")
+                        )
+                    except Exception:
+                        pass  # enrich_admin_codes() will fall back to Python stripping
             metadata.create_all(engine)
             print("  Tables ready.")
 
