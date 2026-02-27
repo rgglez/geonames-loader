@@ -158,15 +158,6 @@ def _detect_strategy(engine: Engine, conn) -> str:
 # -----------------------------------------------------------------------------
 
 
-def _has_postgis(conn) -> bool:
-    """Return True if the PostGIS extension is installed in the current DB."""
-    count = conn.execute(text(
-        "SELECT count(*) FROM pg_extension WHERE extname = 'postgis'"
-    )).scalar()
-    return bool(count)
-# _has_postgis
-
-
 def _has_ganos(conn) -> bool:
     """Return True if the ganos_spatialref extension is installed."""
     count = conn.execute(text(

@@ -652,21 +652,26 @@ def create_indexes(engine: Engine) -> None:
 
         if has_ganos or has_postgis:
             label = "Ganos/ganos_spatialref" if has_ganos else "PostGIS"
-            # Ganos (Aliyun) uses geometry; the ::geography cast is not available.
-            # PostGIS supports both, but geography gives better distance accuracy.
-            if has_ganos:
+            # Use ::geography when the type is registered; fall back to geometry
+            # SRID 4326 on Aliyun Ganos configurations where ganos_geometry was
+            # not loaded with CASCADE and the geography type is absent.
+            with engine.connect() as conn:
+                has_geography = bool(conn.execute(text(
+                    "SELECT count(*) FROM pg_type WHERE typname = 'geography'"
+                )).scalar())
+            if has_geography:
                 geo_stmts = [
                     "CREATE INDEX IF NOT EXISTS geoname_postgis_idx ON geoname"
-                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
+                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
                     "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
-                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
+                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
                 ]
             else:
                 geo_stmts = [
                     "CREATE INDEX IF NOT EXISTS geoname_postgis_idx ON geoname"
-                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
+                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
                     "CREATE INDEX IF NOT EXISTS postalcodes_postgis_idx ON postalcodes"
-                    " USING GIST (ST_MakePoint(longitude, latitude)::geography)",
+                    " USING GIST (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326))",
                 ]
             try:
                 with engine.begin() as conn:
