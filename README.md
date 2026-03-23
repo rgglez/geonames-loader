@@ -149,7 +149,7 @@ indexes, primary keys, foreign keys, and geospatial GIST indexes are created.
 The loader class is selected automatically via a factory: `GeonamesLoader.create(engine)`
 detects the dialect and any installed spatial extensions (Ganos, PostGIS) and
 returns the appropriate subclass (`MySQLLoader`, `PostgreSQLLoader`,
-`PostgreSQLGanosLoader`, or `PostgreSQLPostGISLoader`).
+`PostgreSQLGanosLoader`, `PostgreSQLPostGISLoader`, or `SQLiteLoader`).
 
 ```bash
 python upload/load_geonames.py [--config CONFIG_FILE] [--skip-indexes] [-o]
@@ -385,7 +385,8 @@ geonames-loader/
 │       ├── mysql_loader.py          # MySQLLoader  (MySQL / MariaDB)
 │       ├── postgresql_loader.py     # PostgreSQLLoader  (standard PostgreSQL)
 │       ├── postgresql_ganos_loader.py   # PostgreSQLGanosLoader  (Aliyun Ganos)
-│       └── postgresql_postgis_loader.py # PostgreSQLPostGISLoader  (PostGIS)
+│       ├── postgresql_postgis_loader.py # PostgreSQLPostGISLoader  (PostGIS)
+│       └── sqlite_loader.py         # SQLiteLoader  (SQLite)
 │
 ├── examples/
 │   ├── go/                          # Reverse-geocoding example in Go
