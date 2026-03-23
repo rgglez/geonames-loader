@@ -140,6 +140,9 @@ class GeonamesLoader:
             return PostgreSQLLoader(engine)
         if dialect in ("mysql", "mariadb"):
             return MySQLLoader(engine)
+        if dialect == "sqlite":
+            from .sqlite_loader import SQLiteLoader
+            return SQLiteLoader(engine)
         return cls(engine)
     # create
 
@@ -315,8 +318,11 @@ class GeonamesLoader:
         print("=" * 60)
         print("Geonames database loader")
         print(f"  Engine  : {db_url.get_dialect().name}")
-        print(f"  Host    : {db_url.host}:{db_url.port}")
-        print(f"  Database: {db_url.database}")
+        if db_url.host:
+            print(f"  Host    : {db_url.host}:{db_url.port}")
+            print(f"  Database: {db_url.database}")
+        else:
+            print(f"  File    : {db_url.database}")
         print(f"  Data dir: {data_dir.resolve()}")
         print("=" * 60)
 
