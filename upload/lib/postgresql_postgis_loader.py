@@ -28,3 +28,4 @@ class PostgreSQLPostGISLoader(PostgreSQLLoader):
         except Exception as exc:
             print(f"  [PostGIS GIST indexes skipped: {exc}]")
     # _add_spatial_indexes
+# PostgreSQLPostGISLoader

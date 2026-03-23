@@ -37,3 +37,4 @@ class SQLiteLoader(GeonamesLoader):
             conn.execute(text("VACUUM"))
         print("done")
     # vacuum
+# SQLiteLoader

@@ -33,3 +33,4 @@ class PostgreSQLGanosLoader(PostgreSQLLoader):
         except Exception as exc:
             print(f"  [Ganos GIST indexes skipped: {exc}]")
     # _add_spatial_indexes
+# PostgreSQLGanosLoader

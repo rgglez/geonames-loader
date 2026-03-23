@@ -473,3 +473,4 @@ class GeonamesLoader:
 
         print("\nLoad complete.")
     # run
+# GeonamesLoader

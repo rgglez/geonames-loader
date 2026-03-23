@@ -11,8 +11,7 @@ from pathlib import Path
 import tqdm
 from sqlalchemy import Table, text
 
-from .base import GeonamesLoader, _DROP_ORDER, _has_extension, _iter_tsv_rows
-from . import models
+from .base import GeonamesLoader, _DROP_ORDER, _has_extension
 
 
 class PostgreSQLLoader(GeonamesLoader):
@@ -140,3 +139,4 @@ class PostgreSQLLoader(GeonamesLoader):
             conn.execute(text("VACUUM ANALYZE"))
         print("done")
     # vacuum
+# PostgreSQLLoader

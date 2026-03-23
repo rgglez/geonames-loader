@@ -34,3 +34,4 @@ class MySQLLoader(GeonamesLoader):
             for stmt in pk_stmts + fk_stmts:
                 conn.execute(text(stmt))
     # _add_pk_fk_constraints
+# MySQLLoader
