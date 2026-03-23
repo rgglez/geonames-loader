@@ -1,5 +1,5 @@
 """
-Tests for src/load_geonames.py
+Tests for upload/load_geonames.py
 
 Database-touching tests use SQLite in-memory via SQLAlchemy so no external
 database is required.  PostgreSQL-only code paths (COPY, CASCADE DROP,
@@ -7,12 +7,23 @@ GIST indexes) are not tested here.
 """
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, select, text
 
-import load_geonames as lg
+from upload.lib.base import (
+    GeonamesLoader,
+    load_config,
+    build_engine,
+    _iter_tsv_rows,
+    _strip_accents,
+)
+from upload.lib.mysql_loader import MySQLLoader
+from upload.lib.postgresql_loader import PostgreSQLLoader
+from upload.lib.postgresql_ganos_loader import PostgreSQLGanosLoader
+from upload.lib.postgresql_postgis_loader import PostgreSQLPostGISLoader
+import upload.lib.models as gm
 
 
 # ---------------------------------------------------------------------------
@@ -23,7 +34,7 @@ import load_geonames as lg
 def sqlite_engine():
     """Fresh SQLite in-memory engine with all tables created."""
     engine = create_engine("sqlite:///:memory:")
-    lg.metadata.create_all(engine)
+    gm.metadata.create_all(engine)
     yield engine
     engine.dispose()
 
@@ -40,12 +51,12 @@ class TestLoadConfig:
     def test_returns_parsed_dict(self, tmp_path):
         cfg = tmp_path / "config.yaml"
         cfg.write_text("database:\n  url: sqlite:///test.db\n")
-        result = lg.load_config(str(cfg))
+        result = load_config(str(cfg))
         assert result == {"database": {"url": "sqlite:///test.db"}}
 
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises((FileNotFoundError, OSError)):
-            lg.load_config(str(tmp_path / "missing.yaml"))
+            load_config(str(tmp_path / "missing.yaml"))
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +66,7 @@ class TestLoadConfig:
 class TestBuildEngine:
     def test_url_format(self):
         cfg = {"database": {"url": "sqlite:///:memory:"}}
-        engine = lg.build_engine(cfg)
+        engine = build_engine(cfg)
         assert engine.url.drivername == "sqlite"
         engine.dispose()
 
@@ -64,7 +75,7 @@ class TestBuildEngine:
             "user": "u", "password": "p",
             "host": "localhost", "port": 5432, "dbname": "mydb",
         }}
-        engine = lg.build_engine(cfg)
+        engine = build_engine(cfg)
         assert "postgresql" in engine.url.drivername
         assert engine.url.host == "localhost"
         assert engine.url.database == "mydb"
@@ -72,24 +83,48 @@ class TestBuildEngine:
 
 
 # ---------------------------------------------------------------------------
-# is_postgresql
+# GeonamesLoader.create  (factory)
 # ---------------------------------------------------------------------------
 
-class TestIsPostgresql:
-    def test_true_for_postgresql_dialect(self):
-        engine = MagicMock()
-        engine.dialect.name = "postgresql"
-        assert lg.is_postgresql(engine) is True
-
-    def test_false_for_sqlite(self):
+class TestLoaderFactory:
+    def test_sqlite_returns_base_loader(self):
         engine = create_engine("sqlite:///:memory:")
-        assert lg.is_postgresql(engine) is False
+        loader = GeonamesLoader.create(engine)
+        assert type(loader) is GeonamesLoader
         engine.dispose()
 
-    def test_false_for_mysql(self):
+    def test_mysql_returns_mysql_loader(self):
         engine = MagicMock()
         engine.dialect.name = "mysql"
-        assert lg.is_postgresql(engine) is False
+        assert type(GeonamesLoader.create(engine)) is MySQLLoader
+
+    def test_mariadb_returns_mysql_loader(self):
+        engine = MagicMock()
+        engine.dialect.name = "mariadb"
+        assert type(GeonamesLoader.create(engine)) is MySQLLoader
+
+    def test_postgresql_no_extensions_returns_postgresql_loader(self):
+        engine = MagicMock()
+        engine.dialect.name = "postgresql"
+        with patch("upload.lib.base._has_extension", return_value=False):
+            loader = GeonamesLoader.create(engine)
+        assert type(loader) is PostgreSQLLoader
+
+    def test_postgresql_with_ganos_returns_ganos_loader(self):
+        engine = MagicMock()
+        engine.dialect.name = "postgresql"
+        with patch("upload.lib.base._has_extension",
+                   side_effect=lambda conn, name: name == "ganos_spatialref"):
+            loader = GeonamesLoader.create(engine)
+        assert type(loader) is PostgreSQLGanosLoader
+
+    def test_postgresql_with_postgis_returns_postgis_loader(self):
+        engine = MagicMock()
+        engine.dialect.name = "postgresql"
+        with patch("upload.lib.base._has_extension",
+                   side_effect=lambda conn, name: name == "postgis"):
+            loader = GeonamesLoader.create(engine)
+        assert type(loader) is PostgreSQLPostGISLoader
 
 
 # ---------------------------------------------------------------------------
@@ -100,32 +135,32 @@ class TestIterTsvRows:
     def test_basic_row(self, tmp_path):
         f = tmp_path / "data.txt"
         _write_tsv(f, ["val1\tval2\tval3"])
-        rows = list(lg._iter_tsv_rows(f, ["a", "b", "c"]))
+        rows = list(_iter_tsv_rows(f, ["a", "b", "c"]))
         assert rows == [{"a": "val1", "b": "val2", "c": "val3"}]
 
     def test_empty_string_becomes_none(self, tmp_path):
         f = tmp_path / "data.txt"
         _write_tsv(f, ["val1\t\tval3"])
-        rows = list(lg._iter_tsv_rows(f, ["a", "b", "c"]))
+        rows = list(_iter_tsv_rows(f, ["a", "b", "c"]))
         assert rows[0]["b"] is None
 
     def test_skips_comment_only_line(self, tmp_path):
         f = tmp_path / "data.txt"
         _write_tsv(f, ["# comment", "val1\tval2"])
-        rows = list(lg._iter_tsv_rows(f, ["a", "b"]))
+        rows = list(_iter_tsv_rows(f, ["a", "b"]))
         assert len(rows) == 1
         assert rows[0]["a"] == "val1"
 
     def test_pads_short_lines_with_none(self, tmp_path):
         f = tmp_path / "data.txt"
         _write_tsv(f, ["val1"])
-        rows = list(lg._iter_tsv_rows(f, ["a", "b", "c"]))
+        rows = list(_iter_tsv_rows(f, ["a", "b", "c"]))
         assert rows[0] == {"a": "val1", "b": None, "c": None}
 
     def test_multiple_rows(self, tmp_path):
         f = tmp_path / "data.txt"
         _write_tsv(f, ["a1\tb1", "a2\tb2", "a3\tb3"])
-        rows = list(lg._iter_tsv_rows(f, ["a", "b"]))
+        rows = list(_iter_tsv_rows(f, ["a", "b"]))
         assert len(rows) == 3
         assert rows[2] == {"a": "a3", "b": "b3"}
 
@@ -136,29 +171,29 @@ class TestIterTsvRows:
 
 class TestStripAccents:
     def test_removes_accents(self):
-        assert lg._strip_accents("Café") == "Cafe"
-        assert lg._strip_accents("naïve") == "naive"
-        assert lg._strip_accents("über") == "uber"
-        assert lg._strip_accents("résumé") == "resume"
+        assert _strip_accents("Café") == "Cafe"
+        assert _strip_accents("naïve") == "naive"
+        assert _strip_accents("über") == "uber"
+        assert _strip_accents("résumé") == "resume"
 
     def test_none_returns_none(self):
-        assert lg._strip_accents(None) is None
+        assert _strip_accents(None) is None
 
     def test_ascii_string_unchanged(self):
-        assert lg._strip_accents("hello world") == "hello world"
+        assert _strip_accents("hello world") == "hello world"
 
     def test_empty_string(self):
-        assert lg._strip_accents("") == ""
+        assert _strip_accents("") == ""
 
 
 # ---------------------------------------------------------------------------
-# drop_and_create_tables  (SQLite path)
+# GeonamesLoader.create_tables / drop_tables  (SQLite path)
 # ---------------------------------------------------------------------------
 
-class TestDropAndCreateTables:
+class TestCreateTables:
     def test_creates_all_expected_tables(self):
         engine = create_engine("sqlite:///:memory:")
-        lg.drop_and_create_tables(engine)
+        GeonamesLoader(engine).create_tables()
         expected = {
             "geoname", "alternatename", "countryinfo", "iso_languagecodes",
             "admin1codesascii", "admin2codesascii", "featurecodes", "timezones",
@@ -176,7 +211,7 @@ class TestDropAndCreateTables:
 
     def test_tables_are_empty_after_creation(self):
         engine = create_engine("sqlite:///:memory:")
-        lg.drop_and_create_tables(engine)
+        GeonamesLoader(engine).create_tables()
         with engine.connect() as conn:
             count = conn.execute(text("SELECT count(*) FROM geoname")).scalar()
         assert count == 0
@@ -184,10 +219,10 @@ class TestDropAndCreateTables:
 
 
 # ---------------------------------------------------------------------------
-# _insert_chunks  (SQLite path)
+# GeonamesLoader._bulk_load  (SQLite path)
 # ---------------------------------------------------------------------------
 
-class TestInsertChunks:
+class TestBulkLoad:
     # Use t_featurecodes (code, name, description) — all String columns,
     # no Date/numeric types that SQLite would reject from raw string values.
     _COLS = ["code", "name", "description"]
@@ -195,10 +230,9 @@ class TestInsertChunks:
     def test_inserts_single_row(self, tmp_path, sqlite_engine):
         f = tmp_path / "data.txt"
         _write_tsv(f, ["A.PPL\tPopulated place\tA populated place"])
-        count = lg._insert_chunks(sqlite_engine, lg.t_featurecodes, self._COLS, f)
-        assert count == 1
+        GeonamesLoader(sqlite_engine)._bulk_load(gm.t_featurecodes, self._COLS, f)
         with sqlite_engine.connect() as conn:
-            row = conn.execute(select(lg.t_featurecodes)).fetchone()
+            row = conn.execute(select(gm.t_featurecodes)).fetchone()
         assert row.name == "Populated place"
         assert row.code == "A.PPL"
 
@@ -209,86 +243,94 @@ class TestInsertChunks:
         ]
         f = tmp_path / "data.txt"
         _write_tsv(f, rows)
-        count = lg._insert_chunks(sqlite_engine, lg.t_featurecodes, self._COLS, f)
+        GeonamesLoader(sqlite_engine)._bulk_load(gm.t_featurecodes, self._COLS, f)
+        with sqlite_engine.connect() as conn:
+            count = conn.execute(
+                text("SELECT count(*) FROM featurecodes")
+            ).scalar()
         assert count == 2
 
-    def test_returns_row_count(self, tmp_path, sqlite_engine):
+    def test_inserts_correct_row_count(self, tmp_path, sqlite_engine):
         rows = [f"X.FC{i}\tFeature {i}\tDesc {i}" for i in range(5)]
         f = tmp_path / "data.txt"
         _write_tsv(f, rows)
-        count = lg._insert_chunks(sqlite_engine, lg.t_featurecodes, self._COLS, f)
+        GeonamesLoader(sqlite_engine)._bulk_load(gm.t_featurecodes, self._COLS, f)
+        with sqlite_engine.connect() as conn:
+            count = conn.execute(
+                text("SELECT count(*) FROM featurecodes")
+            ).scalar()
         assert count == 5
 
 
 # ---------------------------------------------------------------------------
-# enrich_admin_codes  (SQLite path — _enrich_nameascii_python branch)
+# GeonamesLoader.enrich_admin_codes  (SQLite path — Python accent branch)
 # ---------------------------------------------------------------------------
 
 class TestEnrichAdminCodes:
     def test_countrycode_derived_from_admin1_code(self, sqlite_engine):
         with sqlite_engine.begin() as conn:
-            conn.execute(lg.t_admin1codesascii.insert(), [
+            conn.execute(gm.t_admin1codesascii.insert(), [
                 {"code": "US.CA", "name": "California", "nameascii": "California", "geonameid": 1},
             ])
-        lg.enrich_admin_codes(sqlite_engine)
+        GeonamesLoader(sqlite_engine).enrich_admin_codes()
         with sqlite_engine.connect() as conn:
-            row = conn.execute(select(lg.t_admin1codesascii)).fetchone()
+            row = conn.execute(select(gm.t_admin1codesascii)).fetchone()
         assert row.countrycode == "US"
 
     def test_countrycode_derived_from_admin2_code(self, sqlite_engine):
         with sqlite_engine.begin() as conn:
-            conn.execute(lg.t_admin2codesascii.insert(), [
+            conn.execute(gm.t_admin2codesascii.insert(), [
                 {"code": "MX.OA.001", "name": "Oaxaca Centro", "nameascii": "Oaxaca Centro", "geonameid": 2},
             ])
-        lg.enrich_admin_codes(sqlite_engine)
+        GeonamesLoader(sqlite_engine).enrich_admin_codes()
         with sqlite_engine.connect() as conn:
-            row = conn.execute(select(lg.t_admin2codesascii)).fetchone()
+            row = conn.execute(select(gm.t_admin2codesascii)).fetchone()
         assert row.countrycode == "MX"
 
     def test_null_name_filled_from_nameascii(self, sqlite_engine):
         with sqlite_engine.begin() as conn:
-            conn.execute(lg.t_admin1codesascii.insert(), [
+            conn.execute(gm.t_admin1codesascii.insert(), [
                 {"code": "MX.OA", "name": None, "nameascii": "Oaxaca", "geonameid": 3},
             ])
-        lg.enrich_admin_codes(sqlite_engine)
+        GeonamesLoader(sqlite_engine).enrich_admin_codes()
         with sqlite_engine.connect() as conn:
-            row = conn.execute(select(lg.t_admin1codesascii)).fetchone()
+            row = conn.execute(select(gm.t_admin1codesascii)).fetchone()
         assert row.name == "Oaxaca"
 
     def test_postal_admin1code_full(self, sqlite_engine):
         with sqlite_engine.begin() as conn:
-            conn.execute(lg.t_postalcodes.insert(), [_postal_row("US", "90210", "CA")])
-        lg.enrich_admin_codes(sqlite_engine)
+            conn.execute(gm.t_postalcodes.insert(), [_postal_row("US", "90210", "CA")])
+        GeonamesLoader(sqlite_engine).enrich_admin_codes()
         with sqlite_engine.connect() as conn:
-            row = conn.execute(select(lg.t_postalcodes)).fetchone()
+            row = conn.execute(select(gm.t_postalcodes)).fetchone()
         assert row.admin1code_full == "US.CA"
 
     def test_postal_admin2code_full(self, sqlite_engine):
         with sqlite_engine.begin() as conn:
-            conn.execute(lg.t_postalcodes.insert(), [_postal_row("US", "90210", "CA", admin2code="001")])
-        lg.enrich_admin_codes(sqlite_engine)
+            conn.execute(gm.t_postalcodes.insert(), [_postal_row("US", "90210", "CA", admin2code="001")])
+        GeonamesLoader(sqlite_engine).enrich_admin_codes()
         with sqlite_engine.connect() as conn:
-            row = conn.execute(select(lg.t_postalcodes)).fetchone()
+            row = conn.execute(select(gm.t_postalcodes)).fetchone()
         assert row.admin2code_full == "US.CA.001"
 
     def test_postal_admin3code_full(self, sqlite_engine):
         with sqlite_engine.begin() as conn:
-            conn.execute(lg.t_postalcodes.insert(), [
+            conn.execute(gm.t_postalcodes.insert(), [
                 _postal_row("US", "90210", "CA", admin2code="001", admin3code="X01")
             ])
-        lg.enrich_admin_codes(sqlite_engine)
+        GeonamesLoader(sqlite_engine).enrich_admin_codes()
         with sqlite_engine.connect() as conn:
-            row = conn.execute(select(lg.t_postalcodes)).fetchone()
+            row = conn.execute(select(gm.t_postalcodes)).fetchone()
         assert row.admin3code_full == "US.CA.001.X01"
 
     def test_postal_nameascii_accent_stripping(self, sqlite_engine):
         with sqlite_engine.begin() as conn:
-            conn.execute(lg.t_postalcodes.insert(), [
+            conn.execute(gm.t_postalcodes.insert(), [
                 _postal_row("MX", "68000", "OA", admin1name="Oaxaçá"),
             ])
-        lg.enrich_admin_codes(sqlite_engine)
+        GeonamesLoader(sqlite_engine).enrich_admin_codes()
         with sqlite_engine.connect() as conn:
-            row = conn.execute(select(lg.t_postalcodes)).fetchone()
+            row = conn.execute(select(gm.t_postalcodes)).fetchone()
         assert row.admin1nameascii == "Oaxaca"
 
 

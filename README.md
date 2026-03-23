@@ -13,6 +13,24 @@ Python scripts to download the [GeoNames](https://www.geonames.org/) data files 
 
 ---
 
+## Table of contents
+
+- [Requirements](#requirements)
+- [Configuration](#configuration)
+- [Usage](#usage)
+  - [1. Download data](#1-download-data----downloaddownload_geonamespy)
+  - [2. Load data](#2-load-data----uploadload_geonamespy)
+- [Distance strategy](#distance-strategy)
+  - [PostgreSQL](#postgresql)
+- [Reverse geocoding examples](#reverse-geocoding-examples)
+  - [Arguments](#arguments)
+  - [Python](#python)
+  - [Go](#go)
+- [Project structure](#project-structure)
+- [License](#license)
+
+---
+
 ## Requirements
 
 - Python 3.10+
@@ -90,7 +108,7 @@ sqlite:///path/to/file.db
 
 ## Usage
 
-### 1. Download data — `download_geonames.py`
+### 1. Download data — `download/download_geonames.py`
 
 Downloads all GeoNames data files from [geonames.org](https://www.geonames.org)
 into the local `data_dir` defined in the config. Files are skipped if they are
@@ -99,7 +117,7 @@ Several files receive post-processing (header stripping, comment removal) to
 make them ready for bulk loading.
 
 ```bash
-src/download_geonames.py [--config CONFIG_FILE]
+python download/download_geonames.py [--config CONFIG_FILE]
 ```
 
 | Flag | Default | Description |
@@ -110,15 +128,15 @@ src/download_geonames.py [--config CONFIG_FILE]
 
 ```bash
 # Download using the default config
-python src/download_geonames.py
+python download/download_geonames.py
 
 # Use a custom config file
-python src/download_geonames.py --config /etc/geonames/config.yaml
+python download/download_geonames.py --config /etc/geonames/config.yaml
 ```
 
 ---
 
-### 2. Load data — `load_geonames.py`
+### 2. Load data — `upload/load_geonames.py`
 
 Creates the GeoNames schema in the target database and bulk-loads all
 downloaded files. On PostgreSQL the load uses the native `COPY` protocol for
@@ -128,8 +146,13 @@ After loading, derived columns are populated (composite admin codes,
 ASCII-normalised name variants) and, unless `--skip-indexes` is passed, all
 indexes, primary keys, foreign keys, and geospatial GIST indexes are created.
 
+The loader class is selected automatically via a factory: `GeonamesLoader.create(engine)`
+detects the dialect and any installed spatial extensions (Ganos, PostGIS) and
+returns the appropriate subclass (`MySQLLoader`, `PostgreSQLLoader`,
+`PostgreSQLGanosLoader`, or `PostgreSQLPostGISLoader`).
+
 ```bash
-src/load_geonames.py [--config CONFIG_FILE] [--skip-indexes] [-o]
+python upload/load_geonames.py [--config CONFIG_FILE] [--skip-indexes] [-o]
 ```
 
 | Flag | Default | Description |
@@ -142,20 +165,20 @@ src/load_geonames.py [--config CONFIG_FILE] [--skip-indexes] [-o]
 
 ```bash
 # Full load (download first, then load)
-python src/download_geonames.py
-python src/load_geonames.py
+python download/download_geonames.py
+python upload/load_geonames.py
 
 # Overwrite an existing database
-python src/load_geonames.py --overwrite
+python upload/load_geonames.py --overwrite
 
 # Load quickly without indexes (e.g. for development/testing)
-python src/load_geonames.py --skip-indexes
+python upload/load_geonames.py --skip-indexes
 
 # Use a custom config file
-python src/load_geonames.py --config /etc/geonames/config.yaml
+python upload/load_geonames.py --config /etc/geonames/config.yaml
 
 # Custom config + overwrite + skip indexes
-python src/load_geonames.py --config /etc/geonames/config.yaml --overwrite --skip-indexes
+python upload/load_geonames.py --config /etc/geonames/config.yaml --overwrite --skip-indexes
 ```
 
 > **Note:** `--skip-indexes` disables the geospatial GIST indexes on
@@ -342,6 +365,42 @@ go build -o reverse_geocode .
 ./reverse_geocode --lat 19.4326 --lon -99.1332
 ./reverse_geocode --lat 48.8566 --lon 2.3522 --country FR --results 5
 ```
+
+---
+
+## Project structure
+
+```
+geonames-loader/
+├── download/                        # Downloader
+│   ├── download_geonames.py         # Entry point: downloads GeoNames files
+│   └── test_download_geonames.py    # Tests for the downloader
+│
+├── upload/                          # Loader
+│   ├── load_geonames.py             # Entry point: loads data into the database
+│   ├── test_load_geonames.py        # Tests for the loader
+│   └── lib/                         # Loader library
+│       ├── models.py                # SQLAlchemy table definitions and indexes
+│       ├── base.py                  # GeonamesLoader base class + shared utilities
+│       ├── mysql_loader.py          # MySQLLoader  (MySQL / MariaDB)
+│       ├── postgresql_loader.py     # PostgreSQLLoader  (standard PostgreSQL)
+│       ├── postgresql_ganos_loader.py   # PostgreSQLGanosLoader  (Aliyun Ganos)
+│       └── postgresql_postgis_loader.py # PostgreSQLPostGISLoader  (PostGIS)
+│
+├── examples/
+│   ├── go/                          # Reverse-geocoding example in Go
+│   └── python/                      # Reverse-geocoding example in Python
+│
+├── config/                          # (user-created) configuration files
+│   └── config.yaml
+├── conftest.py                      # pytest path setup
+├── Makefile                         # test targets
+└── requirements.txt
+```
+
+The loader uses a **factory pattern**: `GeonamesLoader.create(engine)` inspects
+the connected database and returns the most-specific loader class automatically.
+No configuration is needed to select the right dialect or spatial plugin.
 
 ---
 

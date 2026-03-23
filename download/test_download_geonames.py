@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import download_geonames as dg
+import download.download_geonames as dg
 
 
 # ---------------------------------------------------------------------------
